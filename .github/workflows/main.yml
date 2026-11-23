@@ -1,0 +1,140 @@
+# Place this file at .github/workflows/main.yml in the ascend_neb repository.
+# Based on the user's ascend_prl-main (7).zip workflow, adapted for native
+# Ascend C + AscendCL + upstream NEB C reference (NO torch / torch-npu).
+# Build-only CI: GitHub-hosted ARM64 runners do not have Ascend 910B/910C NPUs.
+name: Ascend NEB - ARM64 Native Build and Pre-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      npu_arch:
+        description: 'Ascend C target architecture (default 910B dav-2201; verify your 910C target)'
+        required: true
+        type: string
+        default: dav-2201
+
+permissions:
+  contents: read
+
+jobs:
+  build-aarch64:
+    name: Native Ascend C / AArch64 / CANN 9.0.0
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 120
+    permissions:
+      contents: write # required for the optional pre-release step
+    env:
+      NPU_ARCH: ${{ inputs.npu_arch || 'dav-2201' }}
+      NEB_UPSTREAM_TAG: v1.0.4
+      CANN_URL: https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.0.0/Ascend-cann-toolkit_9.0.0_linux-aarch64.run
+
+    steps:
+      - name: Checkout ascend_neb source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install host build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential gcc g++ make cmake git curl wget ca-certificates \
+            pkg-config python3 libgomp1
+          test "$(uname -m)" = aarch64
+
+      - name: Run NPU-independent host tests / enforce no Torch
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash tests/run_host_tests.sh
+          bash scripts/check_no_torch.sh
+
+      - name: Download and install native CANN 9.0.0 Toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="${RUNNER_TEMP}/Ascend-cann-toolkit_9.0.0_linux-aarch64.run"
+          curl --fail --location --retry 3 --retry-delay 5 \
+            --output "$installer" "$CANN_URL"
+          test -s "$installer"
+          chmod +x "$installer"
+          # A non-root install keeps all files inside the GitHub runner's HOME.
+          bash "$installer" --install --quiet --install-path="${HOME}/Ascend"
+          rm -f "$installer"
+
+          env_file=''
+          for candidate in \
+            "$HOME/Ascend/ascend-toolkit/set_env.sh" \
+            "$HOME/Ascend/cann/set_env.sh" \
+            "$HOME/Ascend/cann-9.0.0/set_env.sh"; do
+            if test -f "$candidate"; then
+              env_file="$candidate"
+              break
+            fi
+          done
+          if test -z "$env_file"; then
+            echo 'CANN set_env.sh not found under ~/Ascend' >&2
+            find "$HOME/Ascend" -name set_env.sh -print || true
+            exit 1
+          fi
+          echo "CANN_ENV_FILE=$env_file" >> "$GITHUB_ENV"
+          echo "[OK] CANN environment: $env_file"
+
+      - name: Fetch the pinned upstream NEB C reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/setup_reference.sh
+          test -f vendor/neb/pow/ref/nebhash2.c
+          test -f vendor/neb/pow/ref/shares.c
+
+      - name: Compile native Ascend C kernel and C++ miner
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$CANN_ENV_FILE"
+          echo "Building Ascend C architecture: $NPU_ARCH"
+          bash scripts/build.sh
+          test -s build/ascend_neb
+          test -s build/libneb_digest.so
+          file build/ascend_neb build/libneb_digest.so
+          # No device tests here: ARM64 runners have no Ascend driver/NPU.
+
+      - name: Package runnable outputs (CANN runtime required on target)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ascend_neb
+          cp -a build/ascend_neb build/libneb_digest.so dist/ascend_neb/
+          cp README_zh.md dist/ascend_neb/
+          cat > dist/ascend_neb/RELEASE_NOTES.txt <<EOF
+          Native Ascend C build for Linux AArch64, NPU_ARCH=${NPU_ARCH}
+          Requires a compatible CANN runtime + Ascend NPU driver at runtime.
+          Built by GitHub Actions WITHOUT physical NPU testing.
+          Run on a 910B/910C host: ./ascend_neb selftest --device 0 --rows 48 --attempts 3
+          No torch / torch-npu dependency.
+          EOF
+          tar -czf "ascend_neb-linux-aarch64-${NPU_ARCH}.tar.gz" -C dist ascend_neb
+          ls -lh "ascend_neb-linux-aarch64-${NPU_ARCH}.tar.gz"
+
+      - name: Upload GitHub Actions build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascend_neb-linux-aarch64-${{ inputs.npu_arch || 'dav-2201' }}
+          path: ascend_neb-linux-aarch64-*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish pre-release (same pattern as ascend_prl)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pre-release-${{ github.run_number }}
+          name: "Ascend NEB Native Pre-release #${{ github.run_number }}"
+          prerelease: true
+          generate_release_notes: false
+          files: ascend_neb-linux-aarch64-*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

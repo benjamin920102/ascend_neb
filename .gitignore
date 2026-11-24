@@ -1,7 +1,0 @@
-build/
-build-host-tests/
-vendor/
-neb-datasets.bin
-*.part
-*.o
-*.so

@@ -6,6 +6,7 @@ import struct
 
 import neb_asc as model
 from asc_backend import get_backend
+import kep1
 
 
 def reference_ticket(header, nonce):
@@ -67,7 +68,31 @@ def main():
             if model.compute_ticket(header, nonce) != ref:
                 raise AssertionError(f'Ticket/digest mismatch: case={case}, cache={cache}')
     print(f'Digest/ticket exact in direct and cache modes: PASS ({args.cases} cases)', flush=True)
+    verify_kep1(mm)
     print('All checked cases passed on the selected backend.')
+
+
+def verify_kep1(mm):
+    signal = (4,) * kep1.INPUT_LENGTH
+    target = (-6,) * kep1.OUTPUT_DIM
+    weights = (4,) * kep1.WEIGHT_COUNT
+    expected = (28,) * 8 + (21,) * 4 + (35,) * 4
+    if kep1.sample_gradient(signal, target, weights, mm) != expected:
+        raise AssertionError("KEP1 forward/backward gradient mismatch")
+    workload = kep1.Workload("Kepler", ((signal, target),), weights)
+    job = model.MiningJob("test", bytes(76), 0, 0, (1 << 256) - 1, workload)
+    table = kep1.contribution_table(workload)
+    direct = model.compute_kep1_ticket(job, 0)
+    if direct != model.compute_kep1_ticket(job, 0, table) or direct[2] != (256,) * 16:
+        raise AssertionError("KEP1 cache or batch clipping mismatch")
+    if model.solution_method(job, bytes(32)) != "mining.submit_block":
+        raise AssertionError("KEP1 block target equality mismatch")
+    if model.solution_method(job, bytes([255]) * 32) != "mining.submit":
+        raise AssertionError("KEP1 share target equality mismatch")
+    updated = kep1.ModelState(weights).apply([direct[2], direct[2]])
+    if updated.weights != (3,) * 16 or updated.residual != (256,) * 16:
+        raise AssertionError("KEP1 residual update mismatch")
+    print("KEP1 gradient, ticket, targets and model update: PASS", flush=True)
 
 
 if __name__ == '__main__':

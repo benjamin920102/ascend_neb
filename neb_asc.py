@@ -3,6 +3,9 @@ import json
 import os
 import struct
 import time
+from math import gcd
+
+import kep1
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -321,8 +324,6 @@ def initialize_asc_worker():
     # Initializing only inside spawn children prevents inherited ACL contexts.
     from asc_backend import get_backend
     get_backend()
-    if os.environ.get("NEB_ASC_CACHE", "1") != "0":
-        rebuild_fixed_cache()
 
 
 def compute_ticket(header_template_76: bytes, nonce_u32: int) -> Tuple[bytes, bytes, int]:
@@ -361,9 +362,36 @@ def compute_ticket(header_template_76: bytes, nonce_u32: int) -> Tuple[bytes, by
 class MiningJob:
     job_id: str
     header_template_76: bytes
-    target_int: int
+    height: int
+    block_target: int
+    share_target: int
+    workload: kep1.Workload
     start_nonce: int = 0
     nonce_step: int = 1
+
+
+def compute_kep1_ticket(job, nonce, table=None):
+    key = blake3_digest(job.header_template_76 + struct.pack("<I", nonce))
+    draws = struct.unpack("<16I", chacha8_block(key, 0))
+    indices = [draw % len(job.workload.samples) for draw in draws]
+    gradient = kep1.batch_gradient(job.workload, indices, table)
+    digest = fold_gradients_to_digest32([gradient], [])
+    return blake3_digest(digest + key), digest, gradient
+
+
+def job_contributions(job):
+    if os.getenv("NEB_ASC_CACHE", "1") != "0":
+        return kep1.contribution_table(job.workload)
+    return None
+
+
+def solution_method(job, ticket):
+    value = int.from_bytes(ticket, "big")
+    if value <= job.block_target:
+        return "mining.submit_block"
+    if value <= job.share_target:
+        return "mining.submit"
+    return None
 
 
 class AsyncPoolClient:
@@ -414,39 +442,33 @@ class AsyncPoolClient:
             "params": [self.worker, self.password],
         })
 
-    async def submit_share(self, job: MiningJob, nonce_u32: int, ticket_hex: str, digest_hex: str) -> None:
-        msg = {
+    async def submit_solution(self, job, method, nonce, ticket, digest):
+        print(f"[Solution] {method} job={job.job_id} nonce={nonce:#010x}")
+        await self.send_json({
             "id": self._next_id(),
-            "method": "mining.submit",
-            "params": [
-                self.worker,
-                job.job_id,
-                f"{nonce_u32:08x}",
-                ticket_hex,
-                digest_hex,
-            ],
-        }
-        print(f"[Share] 提交候選解 -> job={job.job_id}, nonce={nonce_u32:#010x}, ticket={ticket_hex[:16]}...")
-        await self.send_json(msg)
+            "method": method,
+            "params": [self.worker, job.job_id, f"{nonce:08x}", ticket.hex(), digest.hex()],
+        })
 
-    def _parse_job(self, params: dict) -> MiningJob:
-        header_hex = params["header_template_76"]
-        header_bytes = bytes.fromhex(header_hex)
-        if len(header_bytes) != 76:
-            raise ValueError(f"Invalid header_template_76 length: {len(header_bytes)}")
-        target_int = int(params["target_hex"], 16)
-        step = int(params.get("nonce_step", 1))
-        if not 0 < step < (1 << 32):
-            raise ValueError("nonce_step must be in [1, 2**32-1]")
-        if not 0 <= target_int <= (1 << 256):
-            raise ValueError("target must be in [0, 2**256]")
-        return MiningJob(
-            job_id=str(params["job_id"]),
-            header_template_76=header_bytes,
-            target_int=target_int,
-            start_nonce=int(params.get("start_nonce", 0)),
-            nonce_step=int(params.get("nonce_step", 1)),
-        )
+    @staticmethod
+    def _parse_job(params: dict) -> MiningJob:
+        header = bytes.fromhex(params["header_template_76"])
+        height = params["height"]
+        block_target = int(params["block_target_hex"], 16)
+        share_target = int(params["share_target_hex"], 16)
+        start = params.get("start_nonce", 0)
+        step = params.get("nonce_step", 1)
+        if len(header) != 76:
+            raise ValueError("Header template must be 76 bytes")
+        if type(height) is not int or height < 0:
+            raise ValueError("Height must be a nonnegative integer")
+        if (type(start) is not int or type(step) is not int
+                or not 0 <= start < (1 << 32) or not 0 < step < (1 << 32)):
+            raise ValueError("Invalid start_nonce or nonce_step")
+        if not 0 <= block_target <= share_target < (1 << 256):
+            raise ValueError("Targets must satisfy 0 <= block target <= share target < 2**256")
+        return MiningJob(str(params["job_id"]), header, height, block_target, share_target,
+                         kep1.Workload.from_job(height, params), start, step)
 
     async def _handle_server_message(self, msg: dict) -> None:
         method = msg.get("method")
@@ -457,7 +479,7 @@ class AsyncPoolClient:
                 self._job_event.set()
                 print(
                     f"[Pool] 收到新任務 job_id={self._current_job.job_id} "
-                    f"target={self._current_job.target_int:#066x}"
+                    f"height={self._current_job.height} dataset={self._current_job.workload.dataset}"
                 )
         elif "id" in msg and ("result" in msg or "error" in msg):
             if msg.get("error"):
@@ -487,6 +509,7 @@ class AsyncPoolClient:
                 break
             except Exception as exc:
                 self._current_job = None
+                self._job_event.set()
                 print(f"[Pool] 連線異常 ({exc})，3 秒後重試...")
                 await asyncio.sleep(3.0)
             finally:
@@ -511,28 +534,31 @@ class AsyncPoolClient:
 
             job = self._current_job
             self._job_event.clear()
-            nonce = job.start_nonce & 0xFFFFFFFF
+            nonce = job.start_nonce
+            remaining = (1 << 32) // gcd(job.nonce_step, 1 << 32)
+            batch_count = 64
 
             while not self._stop_event.is_set() and self._current_job is job:
-                # 將單批 Nonce 運算丟到 ThreadPoolExecutor，避免阻塞網路讀寫協程
-                batch_count = 64
+                if remaining == 0:
+                    await self._job_event.wait()
+                    break
+                workers = min(self.workers, (remaining + batch_count - 1) // batch_count)
                 results = await asyncio.gather(*(
                     loop.run_in_executor(
                         self._executor, self._scan_nonce_batch, job,
                         (nonce + worker * batch_count * job.nonce_step) & 0xFFFFFFFF,
-                        batch_count,
-                    ) for worker in range(self.workers)
+                        min(batch_count, remaining - worker * batch_count),
+                    ) for worker in range(workers)
                 ))
-                completed = batch_count * self.workers
+                completed = min(remaining, batch_count * workers)
+                remaining -= completed
                 nonce = (nonce + completed * job.nonce_step) & 0xFFFFFFFF
                 hashes_done += completed
-                if self._current_job is not job:
-                    continue
                 for found in results:
-                    for f_nonce, ticket_bytes, digest_bytes in found:
+                    for method, f_nonce, ticket, digest in found:
                         if self._current_job is not job:
                             break
-                        await self.submit_share(job, f_nonce, ticket_bytes.hex(), digest_bytes.hex())
+                        await self.submit_solution(job, method, f_nonce, ticket, digest)
 
                 now = time.monotonic()
                 if now - last_report >= 5.0:
@@ -545,17 +571,16 @@ class AsyncPoolClient:
                 await asyncio.sleep(0)
 
     @staticmethod
-    def _scan_nonce_batch(
-        job: MiningJob, start_nonce: int, batch_count: int
-    ) -> list[Tuple[int, bytes, bytes]]:
+    def _scan_nonce_batch(job, start_nonce, batch_count):
         found = []
-        nonce = start_nonce & 0xFFFFFFFF
-        step = job.nonce_step & 0xFFFFFFFF
+        nonce = start_nonce
+        table = job_contributions(job)
         for _ in range(batch_count):
-            ticket_bytes, digest_bytes, ticket_int = compute_ticket(job.header_template_76, nonce)
-            if ticket_int < job.target_int:
-                found.append((nonce, ticket_bytes, digest_bytes))
-            nonce = (nonce + step) & 0xFFFFFFFF
+            ticket, digest, _ = compute_kep1_ticket(job, nonce, table)
+            method = solution_method(job, ticket)
+            if method:
+                found.append((method, nonce, ticket, digest))
+            nonce = (nonce + job.nonce_step) & 0xFFFFFFFF
         return found
 
     async def run(self) -> None:
@@ -582,69 +607,103 @@ class AsyncPoolClient:
 # ==============================================================================
 
 async def run_mock_pool(host: str = "127.0.0.1", port: int = 13333) -> None:
-    """
-    測試用本機礦池：
-    - 故意設定較寬鬆的 target（前 12 bits 為 0 左右），讓 CPython 在幾秒內就能算出合法 Share
-    - 收到 mining.submit 後，實際重算一次 compute_ticket 驗證是否真的 < target
-    """
-    # 256-bit 上限約 2^256；設定 target = 2^244 約 1/4096 機率命中
-    demo_target = (1 << 244) - 1
-    header_76 = os.urandom(76)
+    """Validate submissions and advance the chain in the local demo."""
+    datasets = {}
+    for name in ("Kepler", "TESS"):
+        stream = ChaCha8Stream(blake3_digest(f"NEB_MOCK_{name}".encode()))
+        datasets[name] = tuple(
+            (
+                tuple((stream.read_u32() & 15) - 8 for _ in range(kep1.INPUT_LENGTH)),
+                tuple((stream.read_u32() & 15) - 8 for _ in range(kep1.OUTPUT_DIM)),
+            )
+            for _ in range(256)
+        )
+    models = {
+        name: kep1.ModelState(tuple(
+            (value & 15) - 8 for value in blake3_digest(b"NEB_MOCK_KEP1", kep1.WEIGHT_COUNT)
+        ))
+        for name in datasets
+    }
+    peers = set()
+    accepted = {}
+    params = {}
+    job = None
 
-    async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        peer = writer.get_extra_info("peername")
-        print(f"[MockPool] 礦工已連線: {peer}")
+    def refresh_job(height):
+        nonlocal params, job
+        dataset = "Kepler" if height % 2 == 0 else "TESS"
+        params = {
+            "job_id": f"job-{height + 1:03d}",
+            "height": height,
+            "header_template_76": os.urandom(76).hex(),
+            "block_target_hex": f"{(1 << 244) - 1:064x}",
+            "share_target_hex": f"{(1 << 250) - 1:064x}",
+            "dataset": dataset,
+            "model": "KEP1",
+            "samples": datasets[dataset],
+            "weights": models[dataset].weights,
+        }
+        job = AsyncPoolClient._parse_job(params)
+
+    def send(writer, payload):
+        writer.write((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+
+    def notify(writer):
+        send(writer, {"method": "mining.notify", "params": params})
+
+    def validate(method, submission):
+        _worker, job_id, nonce_hex, ticket_hex, digest_hex = submission
+        nonce = int(nonce_hex, 16)
+        if job_id != job.job_id or not 0 <= nonce < (1 << 32) or nonce in accepted:
+            return False
+        ticket, digest, gradient = compute_kep1_ticket(job, nonce, job_contributions(job))
+        if (ticket != bytes.fromhex(ticket_hex) or digest != bytes.fromhex(digest_hex)
+                or solution_method(job, ticket) != method):
+            return False
+        if method == "mining.submit":
+            accepted[nonce] = gradient
+        else:
+            dataset = job.workload.dataset
+            models[dataset] = models[dataset].apply(accepted.values())
+            accepted.clear()
+            refresh_job(job.height + 1)
+        return True
+
+    refresh_job(0)
+
+    async def handle_client(reader, writer):
         try:
-            while True:
-                raw = await reader.readline()
-                if not raw:
-                    break
-                req = json.loads(raw.decode("utf-8"))
+            while raw := await reader.readline():
+                req = json.loads(raw)
                 method = req.get("method")
                 req_id = req.get("id")
-
-                if method == "mining.subscribe":
-                    writer.write((json.dumps({"id": req_id, "result": True, "error": None}) + "\n").encode())
-                    await writer.drain()
-                elif method == "mining.authorize":
-                    writer.write((json.dumps({"id": req_id, "result": True, "error": None}) + "\n").encode())
-                    await writer.drain()
-                    notify = {
-                        "method": "mining.notify",
-                        "params": {
-                            "job_id": "job-001",
-                            "header_template_76": header_76.hex(),
-                            "target_hex": f"{demo_target:064x}",
-                            "start_nonce": 0,
-                            "nonce_step": 1,
-                        },
-                    }
-                    writer.write((json.dumps(notify) + "\n").encode())
-                    await writer.drain()
-                elif method == "mining.submit":
-                    _worker, job_id, nonce_hex, ticket_hex, digest_hex = req["params"]
-                    nonce_val = int(nonce_hex, 16)
-                    calc_ticket, calc_digest, calc_int = compute_ticket(header_76, nonce_val)
-                    valid = (
-                        job_id == "job-001"
-                        and calc_ticket.hex() == ticket_hex.lower()
-                        and calc_digest.hex() == digest_hex.lower()
-                        and calc_int < demo_target
-                    )
-                    resp = {
-                        "id": req_id,
-                        "result": valid,
-                        "error": None if valid else "invalid share or ticket >= target",
-                    }
-                    print(f"[MockPool] 驗證 Share nonce={nonce_hex} -> valid={valid}")
-                    writer.write((json.dumps(resp) + "\n").encode())
-                    await writer.drain()
+                valid = method in ("mining.subscribe", "mining.authorize")
+                if method in ("mining.submit", "mining.submit_block") and writer in peers:
+                    try:
+                        valid = validate(method, req["params"])
+                    except (KeyError, TypeError, ValueError):
+                        valid = False
+                    print(f"[MockPool] {method} valid={valid}")
+                send(writer, {
+                    "id": req_id,
+                    "result": valid,
+                    "error": None if valid else "Invalid request or solution",
+                })
+                if method == "mining.authorize":
+                    peers.add(writer)
+                    notify(writer)
+                elif method == "mining.submit_block" and valid:
+                    for peer in peers:
+                        if not peer.is_closing():
+                            notify(peer)
+                await writer.drain()
         finally:
+            peers.discard(writer)
             writer.close()
             await writer.wait_closed()
 
     server = await asyncio.start_server(handle_client, host, port)
-    print(f"[MockPool] 測試礦池啟動於 {host}:{port}")
+    print(f"[MockPool] Listening on {host}:{port}")
     async with server:
         await server.serve_forever()
 
@@ -666,7 +725,7 @@ async def main(args) -> None:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Fixed-workload CPython ticket calculator")
+    parser = argparse.ArgumentParser(description="Ascend INT4 KEP1 miner")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=13333)

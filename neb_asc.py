@@ -165,7 +165,7 @@ def sample_16_from_dataset(key32: bytes) -> Tuple[List[List[int]], List[List[int
     return x_batch, t_batch
 
 
-def deterministic_int4_train_step(
+def reference_int4_train_step(
     x_batch: List[List[int]],
     t_batch: List[List[int]],
     w1: List[List[int]],
@@ -236,6 +236,37 @@ def deterministic_int4_train_step(
     return g1, g2
 
 
+
+def deterministic_int4_train_step(x_batch, t_batch, w1, w2):
+    """All five GEMMs: packed INT4 Cube -> INT32. Shift/clamp on CPU."""
+    from asc_backend import get_backend
+    mm = get_backend().matmul
+    b_size = len(x_batch)
+    if not 1 <= b_size <= 16:
+        raise ValueError("ASC training batch must contain 1..16 rows")
+    for matrix, height, width in ((x_batch, b_size, INPUT_DIM),
+                                  (t_batch, b_size, OUTPUT_DIM),
+                                  (w1, INPUT_DIM, HIDDEN_DIM),
+                                  (w2, HIDDEN_DIM, OUTPUT_DIM)):
+        if len(matrix) != height or any(len(row) != width or
+                any(type(v) is not int or not -8 <= v <= 7 for v in row)
+                for row in matrix):
+            raise ValueError("Invalid INT4 matrix shape or value")
+    def activate(matrix):
+        return [[_clamp(v >> 4, -8, 7) for v in row] for row in matrix]
+    def clip_gradient(matrix):
+        return [[_clamp(v, -256, 256) for v in row] for row in matrix]
+    def transpose(matrix):
+        return [list(row) for row in zip(*matrix)]
+    a1 = activate(mm(x_batch, w1))
+    y2 = activate(mm(a1, w2))
+    e2 = [[_clamp(y2[i][j] - t_batch[i][j], -8, 7)
+           for j in range(OUTPUT_DIM)] for i in range(b_size)]
+    g2 = clip_gradient(mm(transpose(e2), a1))
+    e1 = activate(mm(e2, transpose(w2)))
+    g1 = clip_gradient(mm(transpose(e1), x_batch))
+    return g1, g2
+
 def fold_gradients_to_digest32(g1: List[List[int]], g2: List[List[int]]) -> bytes:
     """
     步驟 5：將 G1, G2 透過 UINT32 XOR 與模數加法折疊成 32-Byte Digest
@@ -285,6 +316,15 @@ def rebuild_fixed_cache() -> None:
     _CONTRIBUTIONS = tuple(table)
 
 
+
+def initialize_asc_worker():
+    # Initializing only inside spawn children prevents inherited ACL contexts.
+    from asc_backend import get_backend
+    get_backend()
+    if os.environ.get("NEB_ASC_CACHE", "1") != "0":
+        rebuild_fixed_cache()
+
+
 def compute_ticket(header_template_76: bytes, nonce_u32: int) -> Tuple[bytes, bytes, int]:
     """Exact reference ticket for the fixed dataset/weights, with cached work.
 
@@ -293,16 +333,21 @@ def compute_ticket(header_template_76: bytes, nonce_u32: int) -> Tuple[bytes, by
     """
     if len(header_template_76) != 76:
         raise ValueError("Header template must be 76 bytes so (76 + 4) = 80 bytes")
-    if _CONTRIBUTIONS is None:
+    use_cache = os.environ.get("NEB_ASC_CACHE", "1") != "0"
+    if use_cache and _CONTRIBUTIONS is None:
         rebuild_fixed_cache()
     key = blake3_digest(header_template_76 + struct.pack("<I", nonce_u32 & 0xFFFFFFFF))
-    # Exactly 16 u32 draws consume exactly one ChaCha8 block.
-    indices = struct.unpack("<16I", chacha8_block(key, 0))
-    rows = [_CONTRIBUTIONS[i % DATASET_SIZE] for i in indices]
-    vals = [max(-256, min(256, sum(col))) for col in zip(*rows)]
-    split = HIDDEN_DIM * INPUT_DIM
-    g1 = [vals[i:i + INPUT_DIM] for i in range(0, split, INPUT_DIM)]
-    g2 = [vals[i:i + HIDDEN_DIM] for i in range(split, len(vals), HIDDEN_DIM)]
+    if not use_cache:
+        x, t = sample_16_from_dataset(key)
+        g1, g2 = deterministic_int4_train_step(x, t, INIT_W1, INIT_W2)
+    else:
+        # Exactly 16 u32 draws consume exactly one ChaCha8 block.
+        indices = struct.unpack("<16I", chacha8_block(key, 0))
+        rows = [_CONTRIBUTIONS[i % DATASET_SIZE] for i in indices]
+        vals = [max(-256, min(256, sum(col))) for col in zip(*rows)]
+        split = HIDDEN_DIM * INPUT_DIM
+        g1 = [vals[i:i + INPUT_DIM] for i in range(0, split, INPUT_DIM)]
+        g2 = [vals[i:i + HIDDEN_DIM] for i in range(split, len(vals), HIDDEN_DIM)]
     digest32 = fold_gradients_to_digest32(g1, g2)
     ticket = blake3_digest(digest32 + key)
     return ticket, digest32, int.from_bytes(ticket, "big")
@@ -492,7 +537,7 @@ class AsyncPoolClient:
                 now = time.monotonic()
                 if now - last_report >= 5.0:
                     rate = hashes_done / (now - last_report)
-                    print(f"[Hashrate] ~{rate:.2f} H/s (CPython 整數模型+BLAKE3+ChaCha8)")
+                    print(f"[Hashrate] ~{rate:.2f} H/s (ASC INT4 cache + BLAKE3 + ChaCha8)")
                     hashes_done = 0
                     last_report = now
 
@@ -518,7 +563,7 @@ class AsyncPoolClient:
         self._executor = ProcessPoolExecutor(
             max_workers=self.workers,
             mp_context=multiprocessing.get_context("spawn"),
-            initializer=rebuild_fixed_cache,
+            initializer=initialize_asc_worker,
         )
         net_task = asyncio.create_task(self._network_loop())
         mine_task = asyncio.create_task(self._mining_loop())

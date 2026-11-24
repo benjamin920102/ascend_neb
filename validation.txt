@@ -1,8 +1,0 @@
-PASS: dataset/weights and 5,140 ChaCha8 words across block boundaries
-PASS: 261 complete tickets, digests and big-endian integers match reference
-PASS: complete batch shares and uint32 nonce wrap/step
-Benchmark: 128 tickets, 3 runs, median, warm cache, single process
-reference: 0.107259 s; 1193.37 tickets/s
-optimized: 0.044061 s; 2905.09 tickets/s
-Speedup: 2.43x
-PASS: TCP JSON-RPC + 2 worker processes; independently verified shares: 128
